@@ -3,10 +3,10 @@ name: Pre-commit checks
 on:
   pull_request:
     branches:
-      - master
+      - test
   push:
     branches:
-      - master
+      - test
   workflow_dispatch: {}
 
 jobs:

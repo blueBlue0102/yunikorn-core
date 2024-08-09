@@ -1,9 +1,6 @@
 name: Pre-commit checks
 
 on:
-  pull_request:
-    branches:
-      - test
   push:
     branches:
       - test
@@ -24,16 +21,12 @@ jobs:
           go-version-file: .go_version
       - name: Check license
         run: make license-check
-        if: ${{ github.event_name == 'pull_request' }}
       - name: Go lint
         run: make lint
-        if: ${{ github.event_name == 'pull_request' }}
       - name: Run Version Check
         run: make pseudo
-        if: ${{ github.event_name == 'pull_request' }}
       - name: Run ShellCheck
         run: make check_scripts
-        if: ${{ github.event_name == 'pull_request' }}
       - name: unit test
         run: make test
       - name: Code coverage

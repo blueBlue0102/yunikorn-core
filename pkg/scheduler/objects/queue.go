@@ -358,11 +358,12 @@ func (sq *Queue) applyConf(conf configs.QueueConfig) error {
 		}
 	}
 
-	// Load the max & guaranteed resources for all but the root queue
+	// Load the max & guaranteed resources and maxApps for all but the root queue
 	if sq.Name != configs.RootQueue {
 		if err = sq.setResourcesFromConf(conf.Resources); err != nil {
 			return err
 		}
+		sq.maxRunningApps = conf.MaxApplications
 	}
 
 	sq.properties = conf.Properties
@@ -387,7 +388,6 @@ func (sq *Queue) setResourcesFromConf(resource configs.Resources) error {
 			zap.Error(err))
 		return err
 	}
-
 	sq.setResources(guaranteedResource, maxResource)
 	return nil
 }
@@ -450,6 +450,16 @@ func (sq *Queue) SetResources(guaranteedResource, maxResource *resources.Resourc
 	sq.Lock()
 	defer sq.Unlock()
 	sq.setResources(guaranteedResource, maxResource)
+}
+
+// SetMaxRunningApps allows setting the maximum running apps on a queue
+func (sq *Queue) SetMaxRunningApps(maxApps uint64) {
+	if sq == nil {
+		return
+	}
+	sq.Lock()
+	defer sq.Unlock()
+	sq.maxRunningApps = maxApps
 }
 
 // setTemplate sets the template on the queue based on the config.
@@ -600,6 +610,13 @@ func (sq *Queue) GetGuaranteedResource() *resources.Resource {
 	return sq.guaranteedResource
 }
 
+// GetMaxApps returns the maximum number of applications that can run in this queue.
+func (sq *Queue) GetMaxApps() uint64 {
+	sq.RLock()
+	defer sq.RUnlock()
+	return sq.maxRunningApps
+}
+
 // GetActualGuaranteedResources returns the actual (including parent) guaranteed resources for the queue.
 func (sq *Queue) GetActualGuaranteedResource() *resources.Resource {
 	if sq == nil {
@@ -608,7 +625,7 @@ func (sq *Queue) GetActualGuaranteedResource() *resources.Resource {
 	parentGuaranteed := sq.parent.GetActualGuaranteedResource()
 	sq.RLock()
 	defer sq.RUnlock()
-	return resources.ComponentWiseMinPermissive(sq.guaranteedResource, parentGuaranteed)
+	return resources.ComponentWiseMin(sq.guaranteedResource, parentGuaranteed)
 }
 
 func (sq *Queue) GetPreemptionDelay() time.Duration {
@@ -1027,6 +1044,12 @@ func (sq *Queue) IncAllocatedResource(alloc *resources.Resource, nodeReported bo
 func (sq *Queue) allocatedResFits(alloc *resources.Resource) bool {
 	sq.RLock()
 	defer sq.RUnlock()
+	// on the root we want to reject a new allocation if it asks for resources not registered
+	// so do not use the "undefined" flag, also handles pruned max for root
+	if sq.isRoot() {
+		return sq.maxResource.FitIn(resources.AddOnlyExisting(alloc, sq.allocatedResource))
+	}
+	// any other queue undefined is always good
 	return sq.maxResource.FitInMaxUndef(resources.AddOnlyExisting(alloc, sq.allocatedResource))
 }
 
@@ -1185,7 +1208,7 @@ func (sq *Queue) getMaxHeadRoom() *resources.Resource {
 func (sq *Queue) internalHeadRoom(parentHeadRoom *resources.Resource) *resources.Resource {
 	sq.RLock()
 	defer sq.RUnlock()
-	headRoom := sq.maxResource.Clone()
+	headRoom := sq.maxResource
 
 	// if we have no max set headroom is always the same as the parent
 	if headRoom == nil {
@@ -1194,14 +1217,14 @@ func (sq *Queue) internalHeadRoom(parentHeadRoom *resources.Resource) *resources
 
 	// calculate what we have left over after removing all allocation
 	// ignore unlimited resource types (ie the ones not defined in max)
-	headRoom.SubOnlyExisting(sq.allocatedResource)
+	headRoom = resources.SubOnlyExisting(headRoom, sq.allocatedResource)
 
 	// check the minimum of the two: parentHeadRoom is nil for root
 	if parentHeadRoom == nil {
 		return headRoom
 	}
 	// take the minimum value of *all* resource types defined
-	return resources.ComponentWiseMinPermissive(headRoom, parentHeadRoom)
+	return resources.ComponentWiseMin(headRoom, parentHeadRoom)
 }
 
 // GetMaxResource returns the max resource for the queue. The max resource should never be larger than the
@@ -1228,12 +1251,10 @@ func (sq *Queue) GetMaxResource() *resources.Resource {
 // When defining a limit you therefore should define all resource quantities.
 func (sq *Queue) GetMaxQueueSet() *resources.Resource {
 	// get the limit for the parent first and check against the queue's own
-	var limit *resources.Resource
 	if sq.parent == nil {
 		return nil
 	}
-	limit = sq.parent.GetMaxQueueSet()
-	return sq.internalGetMax(limit)
+	return sq.internalGetMax(sq.parent.GetMaxQueueSet())
 }
 
 // internalGetMax does the real max calculation.
@@ -1242,9 +1263,6 @@ func (sq *Queue) internalGetMax(parentLimit *resources.Resource) *resources.Reso
 	defer sq.RUnlock()
 	// no parent queue limit set, not even for root
 	if parentLimit == nil {
-		if sq.maxResource == nil {
-			return nil
-		}
 		return sq.maxResource.Clone()
 	}
 	// parent limit set, no queue limit return parent
@@ -1681,20 +1699,6 @@ func (sq *Queue) GetPreemptionPolicy() policies.PreemptionPolicy {
 	return sq.preemptionPolicy
 }
 
-// SetMaxRunningApps allows setting the maximum running apps on a queue
-// test only
-func (sq *Queue) SetMaxRunningApps(max int) {
-	if sq == nil {
-		return
-	}
-	if max < 0 {
-		return
-	}
-	sq.Lock()
-	defer sq.Unlock()
-	sq.maxRunningApps = uint64(max)
-}
-
 // FindEligiblePreemptionVictims is used to locate tasks which may be preempted for the given ask.
 // queuePath is the fully-qualified path of the queue where ask resides
 // ask is the ask we are attempting to preempt for
@@ -1717,6 +1721,15 @@ func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation
 		return nil
 	}
 
+	// create snapshot for ask or preemptor queue
+	sq.createPreemptionSnapshot(results, queuePath)
+	c := sq
+	// set the ask queue for all queues in the ask queue hierarchy
+	for c.parent != nil {
+		results[c.QueuePath].AskQueue = results[queuePath]
+		c = c.parent
+	}
+
 	// walk the subtree contained within the preemption fence and collect potential victims organized by nodeID
 	fence.findEligiblePreemptionVictims(results, queuePath, ask, priorityMap, queuePriority, false)
 
@@ -1724,7 +1737,7 @@ func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation
 }
 
 // createPreemptionSnapshot is used to create a snapshot of the current queue's resource usage and potential preemption victims
-func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnapshot) *QueuePreemptionSnapshot {
+func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnapshot, askQueuePath string) *QueuePreemptionSnapshot {
 	if sq == nil {
 		return nil
 	}
@@ -1734,7 +1747,7 @@ func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnaps
 		return snapshot
 	}
 
-	parentSnapshot := sq.parent.createPreemptionSnapshot(cache)
+	parentSnapshot := sq.parent.createPreemptionSnapshot(cache, askQueuePath)
 	sq.RLock()
 	defer sq.RUnlock()
 	snapshot = &QueuePreemptionSnapshot{
@@ -1746,6 +1759,7 @@ func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnaps
 		MaxResource:        sq.maxResource.Clone(),
 		GuaranteedResource: sq.guaranteedResource.Clone(),
 		PotentialVictims:   make([]*Allocation, 0),
+		AskQueue:           cache[askQueuePath],
 	}
 	cache[sq.QueuePath] = snapshot
 	return snapshot
@@ -1755,20 +1769,16 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 	if sq == nil {
 		return
 	}
-
-	// if this is the target queue, return it but with an empty victim list so we can use it in calculations
-	if sq.QueuePath == queuePath {
-		sq.createPreemptionSnapshot(results)
+	if sq.GetQueuePath() == queuePath {
 		return
 	}
-
 	if sq.IsLeafQueue() {
 		// leaf queue, skip queue if preemption is disabled
 		if sq.GetPreemptionPolicy() == policies.DisabledPreemptionPolicy {
 			return
 		}
 
-		victims := sq.createPreemptionSnapshot(results)
+		victims := sq.createPreemptionSnapshot(results, queuePath)
 
 		// skip this queue if we are within guaranteed limits
 		remaining := results[sq.QueuePath].GetRemainingGuaranteedResource()

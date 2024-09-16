@@ -1,15 +1,13 @@
-name: Pre-commit checks
+name: Push to test
 
 on:
   push:
     branches:
       - test
-  workflow_dispatch: {}
 
 jobs:
-  build:
+  unit-tests:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -19,15 +17,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: .go_version
-      - name: Check license
-        run: make license-check
-      - name: Go lint
-        run: make lint
-      - name: Run Version Check
-        run: make pseudo
-      - name: Run ShellCheck
-        run: make check_scripts
-      - name: unit test
+      - name: Unit tests
         run: make test
       - name: Code coverage
         uses: codecov/codecov-action@v4

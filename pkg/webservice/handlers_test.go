@@ -775,7 +775,7 @@ func TestGetNodeUtilisation(t *testing.T) {
 	alloc := newAlloc("alloc-1", "app", node1.NodeID, resAlloc)
 	assert.Assert(t, node1.TryAddAllocation(alloc), "unexpected failure adding allocation to node")
 	rootQ := partition.GetQueue("root")
-	err = rootQ.IncAllocatedResource(resAlloc, false)
+	err = rootQ.TryIncAllocatedResource(resAlloc)
 	assert.NilError(t, err, "unexpected error returned setting allocated resource on queue")
 	// get nodes utilization
 	resp = &MockResponseWriter{}
@@ -791,7 +791,7 @@ func TestGetNodeUtilisation(t *testing.T) {
 	resAlloc = resources.NewResourceFromMap(map[string]resources.Quantity{"second": 5})
 	alloc = newAlloc("alloc-2", "app", node2.NodeID, resAlloc)
 	assert.Assert(t, node2.TryAddAllocation(alloc), "unexpected failure adding allocation to node")
-	err = rootQ.IncAllocatedResource(resAlloc, false)
+	err = rootQ.TryIncAllocatedResource(resAlloc)
 	assert.NilError(t, err, "unexpected error returned setting allocated resource on queue")
 	// get nodes utilization
 	resp = &MockResponseWriter{}
@@ -1741,12 +1741,10 @@ func TestGetApplicationHandler(t *testing.T) {
 	getApplication(resp, req)
 	err = json.Unmarshal(resp.outputBytes, &appsDao)
 	assert.NilError(t, err, unmarshalError)
-
-	if !appsDao.HasReserved {
-		assert.Equal(t, len(appsDao.Reservations), 0)
-	} else {
-		assert.Check(t, len(appsDao.Reservations) > 0, "app should have at least 1 reservation")
-	}
+	assert.Equal(t, appsDao.ApplicationID, "app-1")
+	assert.Equal(t, appsDao.Partition, "default")
+	assert.Equal(t, appsDao.QueueName, "root.default")
+	assert.Equal(t, len(appsDao.Allocations), 0)
 
 	// test nonexistent partition
 	var req1 *http.Request
@@ -1781,6 +1779,11 @@ func TestGetApplicationHandler(t *testing.T) {
 	getApplication(resp4, req4)
 	err = json.Unmarshal(resp4.outputBytes, &appsDao4)
 	assert.NilError(t, err, unmarshalError)
+	assert.Assert(t, appsDao4 != nil)
+	assert.Equal(t, appsDao4.ApplicationID, "app-1")
+	assert.Equal(t, appsDao4.Partition, "default")
+	assert.Equal(t, appsDao4.QueueName, "root.default")
+	assert.Equal(t, len(appsDao4.Reservations), 0)
 
 	// test invalid queue name
 	var req5 *http.Request

@@ -458,7 +458,7 @@ func TestRemoveApplication(t *testing.T) {
 	assert.Equal(t, len(leaf.applications), 1, "Application was not added to the queue as expected")
 	assert.Assert(t, resources.IsZero(leaf.allocatedResource), "leaf queue allocated resource not zero")
 	// update allocated resources for the hierarchy
-	err = leaf.IncAllocatedResource(res, false)
+	err = leaf.TryIncAllocatedResource(res)
 	assert.NilError(t, err, "increment of allocated resource on queue should not have failed")
 	leaf.RemoveApplication(app)
 	assert.Equal(t, len(leaf.applications), 0, "Application was not removed from the queue as expected")
@@ -471,7 +471,7 @@ func TestRemoveApplication(t *testing.T) {
 	leaf.AddApplication(app)
 	assert.Equal(t, len(leaf.applications), 1, "Application was not added to the queue as expected")
 	assert.Assert(t, resources.IsZero(leaf.allocatedResource), "leaf queue allocated resource not zero")
-	err = leaf.IncAllocatedResource(res, false)
+	err = leaf.TryIncAllocatedResource(res)
 	assert.NilError(t, err, "increment of allocated resource on queue should not have failed")
 	assert.Assert(t, resources.Equals(leaf.allocatedResource, res), "leaf queue allocated resource not updated as expected")
 	leaf.RemoveApplication(app)
@@ -667,10 +667,8 @@ func TestHeadroom(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(map[string]string{"first": "5", "second": "3"})
 	assert.NilError(t, err, "failed to create resource")
-	err = leaf1.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf1")
-	err = leaf2.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf2")
+	leaf1.IncAllocatedResource(res)
+	leaf2.IncAllocatedResource(res)
 
 	// headRoom root should be this (max 20-10 - alloc 10-6)
 	res, err = resources.NewResourceFromConf(map[string]string{"first": "10", "second": "4"})
@@ -727,12 +725,10 @@ func TestHeadroomMerge(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(map[string]string{"first": "5", "second": "5", "third": "5"})
 	assert.NilError(t, err, "failed to create resource")
-	err = leaf1.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf1")
+	leaf1.IncAllocatedResource(res)
 	res, err = resources.NewResourceFromConf(map[string]string{"third": "5", "fourth": "5"})
 	assert.NilError(t, err, "failed to create resource")
-	err = leaf2.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf2")
+	leaf2.IncAllocatedResource(res)
 
 	// root headroom should be nil
 	headRoom := root.getHeadRoom()
@@ -799,10 +795,8 @@ func TestMaxHeadroomNoMax(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(map[string]string{"first": "5", "second": "3"})
 	assert.NilError(t, err, "failed to create resource")
-	err = leaf1.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf1")
-	err = leaf2.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf2")
+	leaf1.IncAllocatedResource(res)
+	leaf2.IncAllocatedResource(res)
 
 	headRoom = root.getMaxHeadRoom()
 	assert.Assert(t, headRoom == nil, "headRoom of root should be nil because no max set for all queues")
@@ -839,10 +833,8 @@ func TestMaxHeadroomMax(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(map[string]string{"first": "5", "second": "3"})
 	assert.NilError(t, err, "failed to create resource")
-	err = leaf1.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf1")
-	err = leaf2.IncAllocatedResource(res, true)
-	assert.NilError(t, err, "failed to set allocated resource on leaf2")
+	leaf1.IncAllocatedResource(res)
+	leaf2.IncAllocatedResource(res)
 
 	// root headroom should be nil
 	headRoom := root.getMaxHeadRoom()
@@ -867,6 +859,159 @@ func TestMaxHeadroomMax(t *testing.T) {
 	assert.NilError(t, err, "failed to create resource")
 	headRoom = leaf2.getMaxHeadRoom()
 	assert.Assert(t, resources.Equals(res, headRoom), "leaf2 queue head room not as expected %v, got: %v", res, headRoom)
+}
+
+// nolint: funlen
+func TestGetFairMaxResource(t *testing.T) {
+	tests := []struct {
+		name             string
+		RootResource     map[string]string
+		ParentResource   map[string]string
+		Tier0Resource    map[string]string
+		Tier0Expectation map[string]string
+		Tier1Resource    map[string]string
+		Tier1Expectation map[string]string
+	}{
+		{
+			name:             "children provide overrides for resources types",
+			RootResource:     map[string]string{"vcore": "1000m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{"vcore": "800m"},
+			Tier0Expectation: map[string]string{"vcore": "800m"},
+			Tier1Resource:    map[string]string{"vcore": "1200m"},
+			Tier1Expectation: map[string]string{"vcore": "1200m"},
+		},
+		{
+			name:             "0's in the root are ommitted. there is no ephemeral-storage available on this cluster",
+			RootResource:     map[string]string{"ephemeral-storage": "0", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{},
+			Tier0Expectation: map[string]string{"memory": "1000", "pods": "1000", "vcore": "1000m"},
+			Tier1Resource:    map[string]string{"vcore": "900m"},
+			Tier1Expectation: map[string]string{"memory": "1000", "pods": "1000", "vcore": "900m"},
+		},
+		{
+			name:             "children provide maximum for resource type that do NOT exist on root queue currently but may later because of autoscaling",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{"nvidia.com/gpu": "100", "vcore": "800m"},
+			Tier0Expectation: map[string]string{"nvidia.com/gpu": "100", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "800m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+		{
+			name:             "this is true even if they are on the root queue but are currently zero",
+			RootResource:     map[string]string{"nvidia.com/gpu": "0", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "0m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{"nvidia.com/gpu": "100", "vcore": "800m"},
+			Tier0Expectation: map[string]string{"nvidia.com/gpu": "100", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "800m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000"},
+		},
+		{
+			name:             "multiple level restrictions",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{"vcore": "900m"},
+			Tier0Resource:    map[string]string{"vcore": "800m"},
+			Tier0Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "800m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "900m"},
+		},
+		{
+			name:             "explicity 0's are honored for non-root queues",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{"ephemeral-storage": "1000", "vcore": "0m"},
+			Tier0Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "0m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+
+		{
+			name:             "nil root resources( no nodes in cluster)",
+			RootResource:     nil,
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{},
+			Tier0Expectation: nil,
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: nil,
+		},
+		{
+			name:             "nil parent resources",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   nil,
+			Tier0Resource:    map[string]string{"ephemeral-storage": "1000", "vcore": "0m"},
+			Tier0Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "0m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+		{
+			name:             "nil leaf resources",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{},
+			Tier0Resource:    map[string]string{"ephemeral-storage": "1000", "vcore": "0m"},
+			Tier0Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "0m"},
+			Tier1Resource:    nil,
+			Tier1Expectation: map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+		{
+			name:             "parent max with type different than child",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{"nvidia.com/gpu": "100"},
+			Tier0Resource:    map[string]string{"vcore": "800m"},
+			Tier0Expectation: map[string]string{"nvidia.com/gpu": "100", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "800m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"nvidia.com/gpu": "100", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+		{
+			name:             "parent explicit 0 limit for type not set in child",
+			RootResource:     map[string]string{"ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+			ParentResource:   map[string]string{"nvidia.com/gpu": "0"},
+			Tier0Resource:    map[string]string{"vcore": "800m"},
+			Tier0Expectation: map[string]string{"nvidia.com/gpu": "0", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "800m"},
+			Tier1Resource:    map[string]string{},
+			Tier1Expectation: map[string]string{"nvidia.com/gpu": "0", "ephemeral-storage": "1000", "memory": "1000", "pods": "1000", "vcore": "1000m"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// create root
+			root, err := createRootQueue(tc.RootResource)
+			assert.NilError(t, err, "queue create failed")
+
+			// create parent
+			parent, err := createManagedQueue(root, "parent", true, tc.ParentResource)
+			assert.NilError(t, err, "failed to create 'parent' queue")
+
+			// create tier0
+			tier0, err := createManagedQueue(parent, "tier0", true, tc.Tier0Resource)
+			assert.NilError(t, err, "failed to create 'tier0' queue")
+
+			// create tier1
+			tier1, err := createManagedQueue(parent, "tier1", true, tc.Tier1Resource)
+			assert.NilError(t, err, "failed to create 'tier1' queue")
+
+			if tc.Tier0Expectation != nil {
+				actualTier0Max := tier0.GetFairMaxResource()
+				expectedTier0Max, err := resources.NewResourceFromConf(tc.Tier0Expectation)
+				assert.NilError(t, err, "failed to create resource")
+
+				if !resources.Equals(expectedTier0Max, actualTier0Max) {
+					t.Errorf("root.parent.tier0 queue expected max %v, got: %v", expectedTier0Max, actualTier0Max)
+				}
+			}
+			if tc.Tier1Expectation != nil {
+				actualTier1Max := tier1.GetFairMaxResource()
+				expectedTier1Max, err := resources.NewResourceFromConf(tc.Tier1Expectation)
+				assert.NilError(t, err, "failed to create resource")
+
+				if !resources.Equals(expectedTier1Max, actualTier1Max) {
+					t.Errorf("root.parent.tier1 queue expected max %v, got: %v", expectedTier1Max, actualTier1Max)
+				}
+			}
+		})
+	}
 }
 
 func TestGetMaxResource(t *testing.T) {
@@ -1133,7 +1278,7 @@ func testOutstanding(t *testing.T, allocMap, usedMap map[string]string) {
 	assert.Equal(t, len(queue2Total), 5)
 
 	// simulate queue1 has some allocated resources
-	err = queue1.IncAllocatedResource(usedRes, false)
+	err = queue1.TryIncAllocatedResource(usedRes)
 	assert.NilError(t, err, "failed to increment allocated resources")
 
 	queue1Total = make([]*Allocation, 0)
@@ -1203,7 +1348,7 @@ func TestGetOutstandingOnlyUntracked(t *testing.T) {
 
 	// simulate queue1 has some allocated resources
 	// after allocation, the max available becomes to be 5
-	err = queue1.IncAllocatedResource(used, false)
+	err = queue1.TryIncAllocatedResource(used)
 	assert.NilError(t, err, "failed to increment allocated resources")
 
 	queue1Total = make([]*Allocation, 0)
@@ -1272,10 +1417,10 @@ func TestAllocationCalcRoot(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(resMap)
 	assert.NilError(t, err, "failed to create basic resource")
-	err = root.IncAllocatedResource(res, false)
+	err = root.TryIncAllocatedResource(res)
 	assert.NilError(t, err, "root queue allocation failed on increment")
 	// increment again should fail
-	err = root.IncAllocatedResource(res, false)
+	err = root.TryIncAllocatedResource(res)
 	if err == nil {
 		t.Error("root queue allocation should have failed to increment (max hit)")
 	}
@@ -1302,10 +1447,10 @@ func TestAllocationCalcSub(t *testing.T) {
 	var res *resources.Resource
 	res, err = resources.NewResourceFromConf(resMap)
 	assert.NilError(t, err, "failed to create basic resource")
-	err = parent.IncAllocatedResource(res, false)
+	err = parent.TryIncAllocatedResource(res)
 	assert.NilError(t, err, "parent queue allocation failed on increment")
 	// increment again should fail
-	err = parent.IncAllocatedResource(res, false)
+	err = parent.TryIncAllocatedResource(res)
 	if err == nil {
 		t.Error("parent queue allocation should have failed to increment (root max hit)")
 	}
@@ -1320,7 +1465,7 @@ func TestAllocationCalcSub(t *testing.T) {
 	}
 
 	// add to the parent, remove from root and then try to remove from parent: root should complain
-	err = parent.IncAllocatedResource(res, false)
+	err = parent.TryIncAllocatedResource(res)
 	assert.NilError(t, err, "parent queue allocation failed on increment")
 	err = root.DecAllocatedResource(res)
 	assert.NilError(t, err, "root queue allocation failed on decrement")
@@ -1691,9 +1836,9 @@ func TestFindEligiblePreemptionVictims(t *testing.T) {
 	parentGuar := map[string]string{siCommon.Memory: "100"}
 	ask := createAllocationAsk("ask1", appID1, true, true, 0, res)
 	ask2 := createAllocationAsk("ask2", appID2, true, true, -1000, res)
-	alloc2 := markAllocated(nodeID1, ask2)
+	alloc2 := createAllocation("ask2", appID2, nodeID1, true, true, -1000, res)
 	ask3 := createAllocationAsk("ask3", appID2, true, true, -1000, res)
-	alloc3 := markAllocated(nodeID1, ask3)
+	alloc3 := createAllocation("ask3", appID2, nodeID1, true, true, -1000, res)
 	root, err := createRootQueue(map[string]string{siCommon.Memory: "1000"})
 	assert.NilError(t, err, "failed to create queue")
 	parent1, err := createManagedQueueGuaranteed(root, "parent1", true, parentMax, parentGuar)
@@ -1721,9 +1866,9 @@ func TestFindEligiblePreemptionVictims(t *testing.T) {
 	assert.NilError(t, err, "failed to add ask")
 	app2.AddAllocation(alloc2)
 	app2.AddAllocation(alloc3)
-	err = leaf2.IncAllocatedResource(alloc2.allocatedResource, false)
+	err = leaf2.TryIncAllocatedResource(alloc2.GetAllocatedResource())
 	assert.NilError(t, err, "failed to inc allocated resources")
-	err = leaf2.IncAllocatedResource(alloc3.allocatedResource, false)
+	err = leaf2.TryIncAllocatedResource(alloc3.GetAllocatedResource())
 	assert.NilError(t, err, "failed to inc allocated resources")
 
 	// verify victims
@@ -2551,7 +2696,7 @@ func TestQueueRunningAppsForSingleAllocationApp(t *testing.T) {
 	err = app.AddAllocationAsk(ask)
 	assert.NilError(t, err, "failed to add ask")
 
-	alloc := markAllocated(nodeID1, ask)
+	alloc := newAllocationWithKey("ask-1", appID1, nodeID1, res)
 	app.AddAllocation(alloc)
 	assert.Equal(t, app.CurrentState(), Running.String(), "app state should be running")
 	assert.Equal(t, leaf.runningApps, uint64(1), "leaf should have 1 app running")

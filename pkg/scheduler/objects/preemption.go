@@ -20,11 +20,13 @@ package objects
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/apache/yunikorn-core/pkg/common"
 	"github.com/apache/yunikorn-core/pkg/common/resources"
 	"github.com/apache/yunikorn-core/pkg/log"
 	"github.com/apache/yunikorn-core/pkg/plugins"
@@ -160,7 +162,7 @@ func (p *Preemptor) initWorkingState() {
 
 	// walk node iterator and track available resources per node
 	p.iterator.ForEachNode(func(node *Node) bool {
-		if !node.IsSchedulable() || (node.IsReserved() && !node.isReservedForApp(reservationKey(nil, p.application, p.ask))) {
+		if !node.IsSchedulable() || (node.IsReserved() && !node.isReservedForApp(reservationKey(nil, p.application, p.ask))) || !node.FitInNode(p.ask.GetAllocatedResource()) {
 			// node is not available, remove any potential victims from consideration
 			delete(allocationsByNode, node.NodeID)
 		} else {
@@ -202,7 +204,6 @@ func (p *Preemptor) checkPreemptionQueueGuarantees() bool {
 			}
 		}
 	}
-
 	return false
 }
 
@@ -213,7 +214,6 @@ func (p *Preemptor) checkPreemptionQueueGuarantees() bool {
 //nolint:funlen
 func (p *Preemptor) calculateVictimsByNode(nodeAvailable *resources.Resource, potentialVictims []*Allocation) (int, []*Allocation) {
 	nodeCurrentAvailable := nodeAvailable.Clone()
-	allocationsByQueueSnap := p.duplicateQueueSnapshots()
 
 	// Initial check: Will allocation fit on node without preemption? This is possible if preemption was triggered due
 	// to queue limits and not node resource limits.
@@ -222,6 +222,7 @@ func (p *Preemptor) calculateVictimsByNode(nodeAvailable *resources.Resource, po
 		return -1, make([]*Allocation, 0)
 	}
 
+	allocationsByQueueSnap := p.duplicateQueueSnapshots()
 	// get the current queue snapshot
 	askQueue, ok := allocationsByQueueSnap[p.queuePath]
 	if !ok {
@@ -326,7 +327,7 @@ func (p *Preemptor) calculateVictimsByNode(nodeAvailable *resources.Resource, po
 					// removing task does not violate queue constraints, adjust queue and node
 					nodeCurrentAvailable.AddTo(victim.GetAllocatedResource())
 					// check if ask now fits and we haven't had this happen before
-					if nodeCurrentAvailable.FitInMaxUndef(p.ask.GetAllocatedResource()) && index < 0 {
+					if nodeCurrentAvailable.FitIn(p.ask.GetAllocatedResource()) && index < 0 {
 						index = len(results)
 					}
 					// add victim to results
@@ -557,6 +558,7 @@ func (p *Preemptor) tryNodes() (string, []*Allocation, bool) {
 func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
 	// validate that sufficient capacity can be freed
 	if !p.checkPreemptionQueueGuarantees() {
+		p.ask.LogAllocationFailure(common.PreemptionDoesNotGuarantee, true)
 		return nil, false
 	}
 
@@ -614,6 +616,7 @@ func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
 
 	if p.ask.GetAllocatedResource().StrictlyGreaterThanOnlyExisting(victimsTotalResource) {
 		// there is shortfall, so preemption doesn't help
+		p.ask.LogAllocationFailure(common.PreemptionShortfall, true)
 		return nil, false
 	}
 
@@ -826,6 +829,18 @@ func (qps *QueuePreemptionSnapshot) GetRemainingGuaranteedResource() *resources.
 		// In case ask queue has guaranteed set, its own values carries higher precedence over the parent or ancestor
 		if qps.AskQueue.QueuePath == qps.QueuePath && !remainingGuaranteed.IsEmpty() {
 			return resources.MergeIfNotPresent(remainingGuaranteed, parent)
+		}
+		// Queue (potential victim queue path) being processed currently sharing common ancestors or parent with ask queue should not propagate its
+		// actual remaining guaranteed to rest of queue's in the queue hierarchy downwards to let them use their own remaining guaranteed only if guaranteed
+		// has been set. Otherwise, propagating the remaining guaranteed downwards would give wrong perception and those queues might not be chosen
+		// as victims for sibling ( who is under guaranteed and starving for resources) in the same level.
+		// Overall, this increases the chance of choosing victims for preemptor from siblings without causing preemption storm or loop.
+		askQueueRemainingGuaranteed := qps.AskQueue.GuaranteedResource.Clone()
+		askQueueUsed := qps.AskQueue.AllocatedResource.Clone()
+		askQueueUsed = resources.SubOnlyExisting(askQueueUsed, qps.AskQueue.PreemptingResource)
+		askQueueRemainingGuaranteed = resources.SubOnlyExisting(askQueueRemainingGuaranteed, askQueueUsed)
+		if !remainingGuaranteed.IsEmpty() && strings.HasPrefix(qps.AskQueue.QueuePath, qps.QueuePath) && !askQueueRemainingGuaranteed.IsEmpty() {
+			return nil
 		}
 	}
 	return resources.ComponentWiseMin(remainingGuaranteed, parent)
